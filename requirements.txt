@@ -1,0 +1,10 @@
+# Core dependencies for Efficient Attention Computation
+torch>=2.0.0
+numpy>=1.20.0
+einops>=0.6.0
+flash-attn>=2.0.0
+
+# Optional dependencies for extended functionality
+matplotlib>=3.5.0
+scipy>=1.7.0
+tqdm>=4.60.0
