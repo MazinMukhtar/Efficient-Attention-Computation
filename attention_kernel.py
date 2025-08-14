@@ -174,17 +174,31 @@ def _fwd_kernel(
     if EVEN_M & EVEN_N:
         if EVEN_HEADDIM:
             # seqlen_q, seqlen_k and headdim all divisible by BLOCK_M, BLOCK_N and BLOCK_HEADDIM
-            q = tl.load(q_ptrs) # loading query tokens, no padding
+            q = tl.load(
+                q_ptrs
+                ) # loading query tokens, no padding
         else: 
             # seqlen_q and seqlen_k divisible by BLOCK_M and BLOCK_N, but headdim not divisible by BLOCK_HEADDIM
-            q = tl.load(q_ptrs, mask=offs_d[:, None] < headdim, other=0.0) # loading query tokens, padding invalid head dimension
+            q = tl.load(
+                q_ptrs, 
+                mask=offs_d[:, None] < headdim, 
+                other=0.0
+                ) # loading query tokens, padding invalid head dimension
     else:
         # seqlen_q or seqlen_k not divisible by BLOCK_M or BLOCK_N, but headdim divisible by BLOCK_HEADDIM
         if EVEN_HEADDIM:
-            q = tl.load(q_ptrs, mask=offs_m[:, None] < seqlen_q, other=0.0) # loading query tokens, padding invalid query tokens
+            q = tl.load(
+                q_ptrs, 
+                mask=offs_m[:, None] < seqlen_q, 
+                other=0.0
+                ) # loading query tokens, padding invalid query tokens
         # seqlen_q, seqlen_k and headdim all not divisible by BLOCK_M, BLOCK_N and BLOCK_HEADDIM
         else: 
-            q = tl.load(q_ptrs, mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim), other=0.0) # loading query tokens, padding invalid query tokens and head dimension
+            q = tl.load(
+                q_ptrs, 
+                mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim), 
+                other=0.0
+                ) # loading query tokens, padding invalid query tokens and head dimension
 
     # Looping over k, v 
     end_n = seqlen_k if not IS_CAUSAL else tl.minimum((start_m + 1) * BLOCK_M, seqlen_k)
@@ -194,18 +208,159 @@ def _fwd_kernel(
         # Loading key - staying in SRAM throughout computation
         if EVEN_N & EVEN_M:
             if EVEN_HEADDIM:
-                k = tl.load(k_ptrs + start_n * stride_kn) # loading key tokens, no padding
+                k = tl.load(
+                    k_ptrs + start_n * stride_kn
+                    ) # loading key tokens, no padding
             else:
-                k = tl.load(k_ptrs + start_n * stride_kn, mask=offs_d[None, :] < headdim, other=0.0) # loading key tokens, padding invalid head dimension
+                k = tl.load(
+                    k_ptrs + start_n * stride_kn, 
+                    mask=offs_d[None, :] < headdim, 
+                    other=0.0
+                    ) # loading key tokens, padding invalid head dimension
         else:
             if EVEN_HEADDIM:
-                k = tl.load(k_ptrs + start_n * stride_kn, mask=(start_n + offs_n)[:, None] < seqlen_k, other=0.0) # loading key tokens, padding invalid key tokens
+                k = tl.load(
+                    k_ptrs + start_n * stride_kn, 
+                    mask=(start_n + offs_n)[:, None] < seqlen_k, 
+                    other=0.0
+                    ) # loading key tokens, padding invalid key tokens
             else: 
-                k = tl.load(k_ptrs + start_n * stride_kn, mask=((start_n + offs_n)[:, None] < seqlen_k & (offs_d[None, :] < headdim)), other=0.0) # loading key tokens, padding invalid key tokens and head dimension
+                k = tl.load(
+                    k_ptrs + start_n * stride_kn, 
+                    mask=((start_n + offs_n)[:, None] < seqlen_k & (offs_d[None, :] < headdim)), 
+                    other=0.0
+                    ) # loading key tokens, padding invalid key tokens and head dimension
 
         # Computing S 
         s = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         s += tl.dot(q, k, trans_b=True)
 
+        if not EVEN_N: # Masking for softmax calculation
+            s += tl.where((start_n + offs_n)[None, :] < seqlen_k, 0, float('-inf')) # invalid key tokens
+        if IS_CAUSAL:
+            s += tl.where(offs_m[:, None] >= (start_n + offs_n)[None, :], 0, float('-inf')) # key tokens after query tokens
+
+        # Loading bias  
+        if BIAS_TYPE != 'none':
+            if BIAS_TYPE == 'vector': # One bias per key position
+                if EVEN_N:
+                    bias = tl.load(
+                        b_ptrs + start_n
+                        ).to(tl.float32) # loading bias, no padding
+                else:
+                    bias = tl.load(
+                        b_ptrs + start_n, 
+                        mask=(start_n + offs_n) < seqlen_k, 
+                        other=0.0
+                        ).to(tl.float32) # loading bias, padding invalid key tokens
+                bias = bias[None, :] # (1, BLOCK_N)
+
+            elif BIAS_TYPE =='matrix': # One bias per query-key pair
+                if EVEN_M & EVEN_N: 
+                    bias = tl.load(b_ptrs + start_n).to(tl.float32) # loading bias, no padding
+                else: 
+                    bias = tl.load(
+                        b_ptrs + start_n,
+                        mask=(offs_m[:, None] < seqlen_q) & ((start_n + offs_n)[None, :] < seqlen_k),
+                        other=0.0
+                    ).to(tl.float32) # loading bias, padding invalid query tokens and key tokens
+
+            # computing m_ij and p - bias
+            s = s * softmax_scale + bias 
+            m_ij = tl.maximum(tl.max(s, 1), lse_i)
+            p = tl.exp(s - m_ij[:, None])
+        else:
+            # computing m_ij and p - no bias
+            s *= softmax_scale 
+            m_ij = tl.maximum(tl.max(s, 1), lse_i)
+            p = tl.exp(s - m_ij[:, None]);
         
+        # Computing l_ij
+        l_ij = tl.sum(p, 1)
+
+        # Scaling o 
+        acc_o_scale = tl.exp(m_i - m_ij)
+        tl.store(t_ptrs, acc_o_scale)
+        acc_o_scale = tl.load(t_ptrs)
+        acc_o *= acc_o_scale[:, None]
+
+        # Loading value - staying in SRAM throughout computation
+        if EVEN_N & EVEN_M:
+            if EVEN_HEADDIM:
+                v = tl.load(
+                    v_ptrs + start_n * stride_vn
+                ) # loading value tokens, no padding
+            else:
+                v = tl.load(
+                    v_ptrs + start_n * stride_vn,
+                    mask=offs_d[None, :] < headdim,
+                    other=0.0
+                ) # loading value tokens, padding invalid head dimension
+        else:
+            if EVEN_HEADDIM:
+                v = tl.load(
+                    v_ptrs + start_n * stride_vn,
+                    mask=(start_n + offs_n)[:, None] < seqlen_k,
+                    other=0.0
+                ) # loading value tokens, padding invalid key tokens
+            else:
+                v = tl.load(
+                    v_ptrs + start_n * stride_vn,
+                    mask=((start_n + offs_n)[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
+                    other=0.0
+                ) # loading value tokens, padding invalid key tokens and head dimension
+
+        # computing o
+        p = p.to(v.dtype)
+        acc_o += tl.dot(p, v)
+
+        # updating m_1 and lse_i 
+        m_i = m_ij 
+        l_i_new = tl.exp(lse_i - m_ij) + l_ij 
+        lse_i = m_ij + tl.log(l_i_new)
+
+    o_scale = tl.exp(m_i - lse_i)
+    tl.store(t_ptrs, o_scale)
+    o_scale = tl.load(t_ptrs)
+    acc_o *= o_scale[:, None]
+
+    start_m = tl.program_id(0)
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+
+    # Writing back l and m 
+    lse_ptrs = Lse + off_hb * seqlen_q_rounded + offs_m 
+    tl.store(lse_ptrs, lse_i)
+
+    offs_d = tl.arange(0, BLOCK_HEADDIM)
+    out_ptrs = (
+        Out 
+        + off_b * stride_ob 
+        + off_h * stride_oh 
+        + (offs_m[:, None] * stride_om + offs_d[None, :])
+    )
+
+    if EVEN_M:
+        if EVEN_HEADDIM:
+            tl.store(
+                out_ptrs, acc_o
+                ) # storing output, no padding
+        else:
+            tl.store(
+                out_ptrs,
+                acc_o, 
+                mask=offs_d[None, :] < headdim
+            ) # storing output, padding invalid head dimension
+    else:
+        if EVEN_HEADDIM:
+            tl.store(
+                out_ptrs, 
+                acc_o,
+                mask=offs_m[:, None] < seqlen_q
+            ) # storing output, padding invalid query tokens 
+        else:
+            tl.store(
+                out_ptrs,
+                acc_o, 
+                mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim)
+            ) # storing output, padding invalid query tokens and head dimension
 # export TRITON_PRINT_AUTOTUNING=1
