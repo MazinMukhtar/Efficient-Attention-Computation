@@ -170,16 +170,22 @@ def _fwd_kernel(
     acc_o = tl.zeros([BLOCK_M, BLOCK_HEADDIM], dtype=tl.float32)
     # (BLOCK_M, BLOCK_HEADDIM)
 
-    # Loading query
+    # Loading query - staying in SRAM throughout computation
     if EVEN_M & EVEN_N:
         if EVEN_HEADDIM:
-            q = tl.load(q_ptrs) 
+            # seqlen_q, seqlen_k and headdim all divisible by BLOCK_M, BLOCK_N and BLOCK_HEADDIM
+            q = tl.load(q_ptrs) # loading query tokens, no padding
         else: 
-            q = tl.load(q_ptrs, mask=offs_m[:, None] < headdim, other=0.0)
+            # seqlen_q and seqlen_k divisible by BLOCK_M and BLOCK_N, but headdim not divisible by BLOCK_HEADDIM
+            q = tl.load(q_ptrs, mask=offs_d[:, None] < headdim, other=0.0) # loading query tokens, padding invalid head dimension
     else:
+        # seqlen_q or seqlen_k not divisible by BLOCK_M or BLOCK_N, but headdim divisible by BLOCK_HEADDIM
         if EVEN_HEADDIM:
-            q = tl.load(q_ptrs, mask=offs_m[:, None] < seqlen_q, other=0.0)
+            q = tl.load(q_ptrs, mask=offs_m[:, None] < seqlen_q, other=0.0) # loading query tokens, padding invalid query tokens
+        # seqlen_q, seqlen_k and headdim all not divisible by BLOCK_M, BLOCK_N and BLOCK_HEADDIM
         else: 
-            q = tl.load(q_ptrs, mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim), other=0.0)
+            q = tl.load(q_ptrs, mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim), other=0.0) # loading query tokens, padding invalid query tokens and head dimension
+
+    
 
 # export TRITON_PRINT_AUTOTUNING=1
