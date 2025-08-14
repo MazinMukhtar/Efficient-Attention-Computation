@@ -1,0 +1,185 @@
+# Library imports
+import math 
+import torch 
+import triton
+import triton.language as tl
+
+# Maintain (BLOCK_M + 2 * BLOCK_N) * BLOCK_HEADDIM * TYPESIZE(BLOCK_HEADDIM) <= 64KB
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128}, num_wraps=4, num_stages=1),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128}, num_wraps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128}, num_wraps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128}, num_wraps=4, num_stages=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128}, num_wraps=8, num_stages=1),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128}, num_wraps=8, num_stages=2),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128}, num_wraps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128}, num_wraps=8, num_stages=4),
+    ],
+    key=['CACHE_KEY_SEQLEN_Q', 'CACHE_KEY_SEQLEN_K', 'BIAS_TYPE', 'IS_CAUSAL', 'BLOCK_HEADDIM']
+)
+@triton.heuristics(
+    values={
+        'EVEN_M': lambda args: args['seqlen_q'] % args['BLOCK_M'] == 0,
+        'EVEN_N': lambda args: args['seqlen_k'] % args['BLOCK_N'] == 0,
+        'EVEN_HEADDIM': lambda args: args['headdim'] % args['BLOCK_HEADDIM'] == 0,
+    }
+)
+
+def _fwd_kernel(
+    Q: tl.tensor,
+    K: tl.tensor,
+    V: tl.tensor,
+    Bias: tl.tensor,
+    Out: tl.tensor,
+    Lse: tl.tensor,
+    TMP: tl. tensor, # Scratchpad buffer to workaround compiler bug
+    softmax_scale: tl.float32,
+    stride_qb: tl.int32,
+    stride_qh: tl.int32,
+    stride_qm: tl.int32,
+    stride_kb: tl.int32,
+    stride_kh: tl.int32,
+    stride_kn: tl.int32,
+    stride_vb: tl.int32,
+    stride_vh: tl.int32,
+    stride_vn: tl.int32,
+    stride_bb: tl.int32,
+    stride_bh: tl.int32,
+    stride_bm: tl.int32,
+    stride_ob: tl.int32,
+    stride_oh: tl.int32,
+    stride_om: tl.int32,
+    nheads: tl.int32,
+    seqlen_q: tl.int32,
+    seqlen_k: tl.int32,
+    seqlen_q_rounded: tl.int32,
+    headdim: tl.int32,
+    CACHE_KEY_SEQLEN_Q: tl.int32,
+    CACHE_KEY_SEQLEN_K: tl.int32,
+    BIAS_TYPE: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    BLOCK_HEADDIM: tl.constexpr,
+    EVEN_M: tl.constexpr,
+    EVEN_N: tl.constexpr,
+    EVEN_HEADDIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr
+):
+    '''
+    Forward kernel for attention computation.
+
+    Args:
+        Q (tl.tensor): Query tensor of shape (seqlen_q, nheads, headdim)
+        K (tl.tensor): Key tensor of shape (seqlen_k, nheads, headdim)
+        V (tl.tensor): Value tensor of shape (seqlen_k, nheads, headdim)
+        Bias (tl.tensor): Bias tensor of shape (nheads, seqlen_q, seqlen_k)
+        Out (tl.tensor): Output tensor of shape (seqlen_q, nheads, headdim)
+        Lse (tl.tensor): Log sum exp tensor of shape (seqlen_q, nheads)
+        TMP (tl.tensor): Scratchpad buffer of shape (seqlen_q, nheads, BLOCK_M + 2 * BLOCK_N)
+        softmax_scale (tl.float32): Scale factor for softmax
+        stride_qb (tl.int32): Stride for query batch
+        stride_qh (tl.int32): Stride for query head
+        stride_qm (tl.int32): Stride for query sequence length
+        stride_kb (tl.int32): Stride for key batch
+        stride_kh (tl.int32): Stride for key head
+        stride_kn (tl.int32): Stride for key sequence length
+        stride_vb (tl.int32): Stride for value batch
+        stride_vh (tl.int32): Stride for value head
+        stride_vn (tl.int32): Stride for value sequence length
+        stride_bb (tl.int32): Stride for bias batch
+        stride_bh (tl.int32): Stride for bias head
+        stride_bm (tl.int32): Stride for bias sequence length
+        stride_ob (tl.int32): Stride for output batch
+        stride_oh (tl.int32): Stride for output head
+        stride_om (tl.int32): Stride for output sequence length
+        nheads (tl.int32): Number of attention heads
+        seqlen_q (tl.int32): Length of query sequence
+        seqlen_k (tl.int32): Length of key sequence
+        seqlen_q_rounded (tl.int32): Rounded query sequence length
+        headdim (tl.int32): Dimension of each attention head
+        CACHE_KEY_SEQLEN_Q (tl.int32): Cache key for query sequence length
+        CACHE_KEY_SEQLEN_K (tl.int32): Cache key for key sequence length
+        BIAS_TYPE (tl.constexpr): Type of bias
+        IS_CAUSAL (tl.constexpr): Whether to use causal attention
+        BLOCK_HEADDIM (tl.constexpr): Block size for head dimension
+        EVEN_M (tl.constexpr): Whether query sequence length is divisible by BLOCK_M
+        EVEN_N (tl.constexpr): Whether key sequence length is divisible by BLOCK_N
+        EVEN_HEADDIM (tl.constexpr): Whether head dimension is divisible by BLOCK_HEADDIM
+        BLOCK_M (tl.constexpr): Block size for query sequence length
+        BLOCK_N (tl.constexpr): Block size for key sequence length
+    '''
+    # Get indices for query tokens and batch-head pair
+    start_m = tl.program_id(0) # Starting index for query tokens 
+    off_hb = tl.program_id(1) # Starting index for batch-head pair 
+    off_b = off_hb // nheads # Batch index
+    off_h = off_hb % nheads # Head index
+
+    # Initialize offsets for query tokens, key tokens, and head dimension
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M) # Offset for query tokens
+    offs_n = tl.arange(0, BLOCK_N) # Offset for key tokens
+    offs_d = tl.arange(0, BLOCK_HEADDIM) # Offset for head dimension
+
+    # Initializing pointers for query, key and value 
+    q_ptrs = (
+        Q 
+        + off_b * stride_qb 
+        + off_h * stride_qh 
+        + (offs_m[:, None] * stride_qm + offs_d[None, :])
+        # Query + (batch offset * batch stride) + (head offset * head stride) + (query token offset * query token stride) + (head dimension offset * head dimension stride)
+        # (seqlen_q, BLOCK_M, BLOCK_HEADDIM)
+    )
+    k_ptrs = (
+        K 
+        + off_b * stride_kb 
+        + off_h * stride_kh 
+        + (offs_n[:, None] * stride_kn + offs_d[None, :])
+        # Key + (batch offset * batch stride) + (head offset * head stride) + (key token offset * key token stride) + (head dimension offset * head dimension stride)
+        # (seqlen_k, BLOCK_N, BLOCK_HEADDIM)
+    )
+    v_ptrs = (
+        V 
+        + off_b * stride_vb 
+        + off_h * stride_vh 
+        + (offs_n[:, None] * stride_vn + offs_d[None, :])
+        # Value + (batch offset * batch stride) + (head offset * head stride) + (value token offset * value token stride) + (head dimension offset * head dimension stride)
+        # (seqlen_k, BLOCK_N, BLOCK_HEADDIM)
+    )
+
+    if BIAS_TYPE == 'vector': # One bias per key position
+        b_ptrs = Bias + off_b * stride_bb + off_h * stride_bh + offs_n 
+        # Bias + (batch offset * batch stride) + (head offset * head stride) + key token offset
+        # (seqlen_k)
+    elif BIAS_TYPE == 'matrix': # One bias per query-key pair
+        b_ptrs = (
+            Bias 
+            + off_b * stride_bb 
+            + off_h * stride_bh
+            + (offs_m[:, None] * stride_bm + offs_n[None, :])
+        )
+        # Bias + (batch offset * batch stride) + (head offset * head stride) + (query token offset * query token stride) + (key token offset)
+        # (seqlen_q, seqlen_k)
+    # Initializing pointers for scratchpad buffer, log sum exp and m
+    t_ptrs = TMP + off_hb * seqlen_q_rounded + offs_m 
+    # Scratchpad buffer + (batch-head offset * sequence length) + query token offset
+    # (seqlen_q, BLOCK_M + 2 * BLOCK_N)
+    lse_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float('inf')
+    # (BLOCK_M)
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    # (BLOCK_M)
+    acc_o = tl.zeros([BLOCK_M, BLOCK_HEADDIM], dtype=tl.float32)
+    # (BLOCK_M, BLOCK_HEADDIM)
+
+    # Loading query
+    if EVEN_M & EVEN_N:
+        if EVEN_HEADDIM:
+            q = tl.load(q_ptrs) 
+        else: 
+            q = tl.load(q_ptrs, mask=offs_m[:, None] < headdim, other=0.0)
+    else:
+        if EVEN_HEADDIM:
+            q = tl.load(q_ptrs, mask=offs_m[:, None] < seqlen_q, other=0.0)
+        else: 
+            q = tl.load(q_ptrs, mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim), other=0.0)
+
+# export TRITON_PRINT_AUTOTUNING=1
