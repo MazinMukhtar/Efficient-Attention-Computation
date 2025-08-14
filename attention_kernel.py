@@ -186,6 +186,26 @@ def _fwd_kernel(
         else: 
             q = tl.load(q_ptrs, mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim), other=0.0) # loading query tokens, padding invalid query tokens and head dimension
 
-    
+    # Looping over k, v 
+    end_n = seqlen_k if not IS_CAUSAL else tl.minimum((start_m + 1) * BLOCK_M, seqlen_k)
+    for start_n in range(0, end_n, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
 
+        # Loading key - staying in SRAM throughout computation
+        if EVEN_N & EVEN_M:
+            if EVEN_HEADDIM:
+                k = tl.load(k_ptrs + start_n * stride_kn) # loading key tokens, no padding
+            else:
+                k = tl.load(k_ptrs + start_n * stride_kn, mask=offs_d[None, :] < headdim, other=0.0) # loading key tokens, padding invalid head dimension
+        else:
+            if EVEN_HEADDIM:
+                k = tl.load(k_ptrs + start_n * stride_kn, mask=(start_n + offs_n)[:, None] < seqlen_k, other=0.0) # loading key tokens, padding invalid key tokens
+            else: 
+                k = tl.load(k_ptrs + start_n * stride_kn, mask=((start_n + offs_n)[:, None] < seqlen_k & (offs_d[None, :] < headdim)), other=0.0) # loading key tokens, padding invalid key tokens and head dimension
+
+        # Computing S 
+        s = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        s += tl.dot(q, k, trans_b=True)
+
+        
 # export TRITON_PRINT_AUTOTUNING=1
