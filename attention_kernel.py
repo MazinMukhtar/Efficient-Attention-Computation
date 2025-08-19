@@ -363,4 +363,85 @@ def _fwd_kernel(
                 acc_o, 
                 mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim)
             ) # storing output, padding invalid query tokens and head dimension
+
+@triton.jit 
+def _bwd_preprocess_do_o_dot(
+    Out: tl.tensor,
+    DO: tl.tensor,
+    Delta: tl.tensor,
+    stride_ob: tl.int32,
+    stride_oh: tl.int32,
+    stride_om: tl.int32,
+    stride_dob: tl.int32,
+    stride_doh: tl.int32,
+    stride_dom: tl.int32,
+    nheads: tl.int32,
+    seqlen_q: tl.int32,
+    seqlen_q_rounded: tl.int32,
+    headdim: tl.int32,
+    BLOCK_M: tl.constexpr,
+    BLOCK_HEADDIM: tl.constexpr
+):
+    '''
+    Preprocess for backward pass of attention computation.
+
+    Args:
+        Out (tl.tensor): Output tensor of shape (seqlen_q, nheads, headdim)
+        DO (tl.tensor): Delta of output tensor of shape (seqlen_q, nheads, headdim)
+        Delta (tl.tensor): Delta tensor of shape (seqlen_q, nheads, headdim)
+        stride_ob (tl.int32): Stride for output batch
+        stride_oh (tl.int32): Stride for output head
+        stride_om (tl.int32): Stride for output sequence length
+        stride_dob (tl.int32): Stride for delta output batch
+        stride_doh (tl.int32): Stride for delta output head
+        stride_dom (tl.int32): Stride for delta output sequence length
+        nheads (tl.int32): Number of attention heads
+        seqlen_q (tl.int32): Length of query sequence
+        seqlen_q_rounded (tl.int32): Rounded query sequence length
+        headdim (tl.int32): Dimension of each attention head
+        BLOCK_M (tl.constexpr): Block size for query sequence length
+        BLOCK_HEADDIM (tl.constexpr): Block size for head dimension
+    '''
+
+    start_m = tl.program_id(0) # Starting index for query tokens 
+    off_hb = tl.program_id(1) # Starting index for batch-head pair
+    off_b = off_hb // nheads # Batch index
+    off_h = off_hb % nheads # Head index
+
+    # Initializing offsets for query and head dimension 
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M) # Offset for query tokens
+    offs_d = tl.arange(0, BLOCK_HEADDIM) # Offset for head dimension
+
+    # Loading output - staying in SRAM throughout computation
+    o = tl.load(
+        Out 
+        + off_b * stride_ob 
+        + off_h * stride_oh 
+        + (offs_m[:, None] * stride_om + offs_d[None, :]),
+        # Out + (batch offset * batch stride) + (head offset * head stride) + (query token offset * query token stride) + head dimension offset
+        # (seqlen_q, BLOCK_M, BLOCK_HEADDIm)
+        mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim), # masking invalid query tokens and head dimension
+        other=0.0 # padding invalid query tokens and head dimension
+    ).to(tl.float32)
+
+    # Loading delta of output - staying in SRAM throughout computation
+    do = tl.load(
+        DO 
+        + off_b * stride_dob 
+        + off_h * stride_doh 
+        + offs_m[:, None] * stride_dom 
+        + offs_d[None, :], 
+        # Delta of Output + (batch offset * batch stride) + (head offset * head stride) + (query token offset * query token stride) + head dimension offset
+        # (seqlen_q, BLOCK_M, BLOCK_HEADDIM)
+        mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim), # masking invalid query tokens and head dimension
+        other=0.0 # padding invalid query tokens and head dimension
+    ).to(tl.float32)
+
+    # Computing delta
+    delta = tl.sum(o * do, axis=1) # (BLOCK_M, )
+
+    # Writing back delta
+    tl.store(Delta + off_hb * seqlen_q_rounded + offs_m, delta) 
+
+
 # export TRITON_PRINT_AUTOTUNING=1
