@@ -443,5 +443,324 @@ def _bwd_preprocess_do_o_dot(
     # Writing back delta
     tl.store(Delta + off_hb * seqlen_q_rounded + offs_m, delta) 
 
+@triton.jit 
+def _bwd_store_dk_dv(
+    dk_ptrs: tl.tensor,
+    dv_ptrs: tl.tensor,
+    dk: tl.tensor,
+    dv: tl.tensor,
+    offs_n: tl.int32,
+    offs_d: tl.int32,
+    seqlen_k: tl.int32,
+    headdim: tl.int32,
+    EVEN_M: tl.constexpr,
+    EVEN_N: tl.constexpr,
+    EVEN_HEADDIM: tl.constexpr
+):
+    ''' 
+    Store delta of key and value 
+
+    Args:
+        dk_ptrs (tl.tensor): Pointers for delta of key
+        dv_ptrs (tl.tensor): Pointers for delta of value
+        dk (tl.tensor): Delta of key tensor of shape (seqlen_k, nheads, headdim)
+        dv (tl.tensor): Delta of value tensor of shape (seqlen_k, nheads, headdim)
+        offs_n (tl.int32): Offset for key sequence length
+        offs_d (tl.int32): Offset for head dimension
+        seqlen_k (tl.int32): Length of key sequence
+        headdim (tl.int32): Dimension of each attention head
+        EVEN_M (tl.constexpr): Whether query sequence length is divisible by BLOCK_M
+        EVEN_N (tl.constexpr): Whether key sequence length is divisible by BLOCK_N
+        EVEN_HEADDIM (tl.constexpr): Whether head dimension is divisible by BLOCK_HEADDIM
+    '''
+
+    if EVEN_N & EVEN_M:
+        if EVEN_HEADDIM:
+            tl.store(dv_ptrs, dv) # storing delta of value, no padding
+            tl.store(dk_ptrs, dk) # storing delta of key, no padding
+        else:
+            tl.store(dv_ptrs, dv, mask=offs_d[None, :] < headdim) # storing delta of value, padding invalid head dimension
+            tl.store(dk_ptrs, dk, mask=offs_d[None, :] < headdim) # storing delta of key, padding invalid head dimension
+    else:
+        if EVEN_HEADDIM:
+            tl.store(dv_ptrs, dv, mask=(offs_n + offs_d)[:, None] < seqlen_k) # storing delta of value, padding invalid key tokens
+            tl.store(dk_ptrs, dk, mask=(offs_n + offs_d)[:, None] < seqlen_k) # storing delta of key, padding invalid key tokens
+        else:
+            tl.store(dv_ptrs, dv, mask=((offs_n + offs_d)[:, None] < seqlen_k) & (offs_d[None, :] < headdim)) # storing delta of value, padding invalid key tokens and head dimension
+            tl.store(dk_ptrs, dk, mask=((offs_n + offs_d)[:, None] < seqlen_k) & (offs_d[None, :] < headdim)) # storing delta of key, padding invalid key tokens and head dimension
+
+@triton.jit 
+def _bwd_kernel_one_col_block(
+    start_n: tl.int32,
+    Q: tl.tensor,
+    K: tl.tensor,
+    V: tl.tensor,
+    Bias: tl.tensor,
+    DO: tl.tesnor,
+    DQ: tl.tensor,
+    DK: tl.tensor,
+    DV: tl.tensor,
+    LSE: tl.tensor,
+    D: tl.tensor,
+    softmax_scale: tl.float32,
+    stride_qm: tl.int32,
+    stride_kn: tl.int32,
+    stride_vn: tl.int32,
+    stride_bm: tl.int32,
+    stride_dom: tl.int32,
+    stride_dqm: tl.int32,
+    stride_dkn: tl.int32,
+    stride_dvn: tl.int32,
+    seqlen_q: tl.int32,
+    seqlen_k: tl.int32,
+    headdim: tl.int32,
+    ATOMIC_ADD: tl.constexpr,
+    BIAS_TYPE: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    BLOCK_HEADDIM: tl.constexpr,
+    EVEN_M: tl.constexpr,
+    EVEN_N: tl.constexpr,
+    EVEN_HEADDIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr
+):
+    # Ensuring begin_m is a multiple of BLOCK_M - 0 if not causal, otherwise the first block of the current row
+    begin_m = 0 if not IS_CAUSAL else ((start_n * BLOCK_N) // BLOCK_M) * BLOCK_M
+
+    # Initialzing offsets for query, key and head
+    offs_qm = begin_m + tl.arange(0, BLOCK_M) # (BLOCK_M, ) 
+    offs_n = start_n * BLOCK_N + tl.arange(0, BLOCK_N) # (BLOCK_N, )
+    offs_m = tl.arange(0, BLOCK_M) # (BLOCK_M, )
+    offs_d = tl.arange(0, BLOCK_HEADDIM) # (BLOCK_HEADDIM, )
+
+    # Iniitalizing pointers to query, key, value, delta of output and delta of query
+    q_ptrs = Q + (offs_qm[:, None] * stride_qm + offs_d[None, :])
+    # Query + (query token offset * query token stride) + head dimension offset
+    # (seqlen_q, BLOCK_M, BLOCK_HEADDIM)
+    k_ptrs = K + (offs_n[:, None] * stride_kn + offs_d[None, :])
+    # Key + (key token offset * key token stride) + head dimension offset
+    # (seqlen_k, BLOCK_N, BLOCK_HEADDIM)
+    v_ptrs = V + (offs_n[:, None] * stride_vn + offs_d[None, :])
+    # Value + (key token offset * value token stride) + head dimension offset
+    # (seqlen_k, BLOCK_N, BLOCK_HEADDIM)
+    do_ptrs = DO + (offs_qm[:, None] * stride_dom + offs_d[None, :])
+    # Delta of Output + (query token offset * delta output stride) + head dimension offset
+    # (seqlen_q, BLOCK_M, BLOCK_HEADDIM)
+    dq_ptrs = DQ + (offs_qm[:, None] * stride_dqm + offs_d[None, :])
+    # Delta of Query + (query token offset * delta query stride) + head dimension offset
+    # (seqlen_q, BLOCK_M, BLOCK_HEADDIM)
+    
+    # Initializing bias pointers
+    if BIAS_TYPE == 'vector':
+        b_ptrs = Bias + offs_n
+        # Bias + key token offset
+        # (seqlen_k, )
+    elif BIAS_TYPE == 'matrix':
+        b_ptrs = Bias + (offs_qm[:, None] * stride_bm + offs_n[None, :])
+        # Bias + (query token offset * bias stride) + key token offset
+        # (seqlen_q, BLOCK_M, BLOCK_N)
+
+    # Initializing delta of key and delta of value 
+    dv = tl.zeros((BLOCK_N, BLOCK_HEADDIM), dtype=tl.float32)
+    dk = tl.zeros((BLOCK_N, BLOCK_HEADDIM), dtype=tl.float32)
+
+    if begin_m >= seqlen_q:
+        dv_ptrs = DV + (offs_n[:, None] * stride_dvn + offs_d[None, :])
+        # Delta of Value + (key token offset * delta value stride) + head dimension offset
+        dk_ptrs = DK + (offs_n[:, None] * stride_dkn + offs_d[None, :])
+        # Delta of Key + (key token offset * delta key stride) + head dimension offset
+        _bwd_store_dk_dv(
+            dk_ptrs,
+            dv_ptrs,
+            dk,
+            dv,
+            offs_n,
+            offs_d,
+            seqlen_k,
+            headdim,
+            EVEN_M,
+            EVEN_N,
+            EVEN_HEADDIM
+        )
+        return 
+
+    if EVEN_N & EVEN_M:
+        if EVEN_HEADDIM:
+            k = tl.load(k_ptrs) # Loading key tokens, no padding
+            v = tl.load(v_ptrs) # Loading value tokens, no paddings
+        else:
+            k = tl.load(k_ptrs, mask=offs_d[None, :] < headdim, other=0.0) # Loading key tokens, padding invalid head dimension
+            v = tl.load(v_ptrs, mask=offs_d[None, :] < headdim, other=0.0) # Loading value tokens, padding invalid head dimension
+    else:
+        if EVEN_HEADDIM:
+            k = tl.load(k_ptrs, mask=offs_n[:, None] < seqlen_k, other=0.0) # Loading key tokens, padding invalid key tokens
+            v = tl.load(v_ptrs, mask=offs_n[:, None] < seqlen_k, other=0.0) # Loading value tokens, padding invalid key tokens
+        else:
+            k = tl.load(
+                k_ptrs,
+                mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
+                other=0.0
+            ) # Loading key tokens, padding invalid key tokens and head dimension
+            v = tl.load(
+                v_ptrs,
+                mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
+                other=0.0
+            ) # Loading value tokens, padding invalid key tokens and head dimension
+
+    num_block_m = tl.cdiv(seqlen_q, BLOCK_M)
+    for start_m in range(begin_m, num_block_m * BLOCK_M, BLOCK_M):
+        start_m = tl.multiple_of(start_m, BLOCK_M)
+
+        offs_m_curr = start_m + offs_m 
+
+        if EVEN_M & EVEN_HEADDIM:
+            q = tl.load(q_ptrs) # Loading query tokens, no padding
+        else:
+            if EVEN_HEADDIM:
+                tl.load(q_ptrs, mask=offs_m_curr[:, None] < seqlen_q, other=0.0) # Loading query tokens, padding invalid query tokens
+            else:
+                q = tl.load(
+                    q_ptrs,
+                    mask=(offs_m_curr[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
+                    other=0.0
+                ) # Loading query tokens, padding invalid query tokens and head dimension
+
+        qk = tl.dot(q, k, trans_b=True) # (BLOCK_M, BLOCK_N)
+
+        if not EVEN_M:
+            qk = tl.where(offs_n[None, :] < seqlen_k, qk, float('-inf')) # Masking invalid key tokens
+
+        if IS_CAUSAL:
+            qk = tl.where(offs_m_curr[:, None] >= (offs_n[None, :]), qk, float('-inf')) # Masking future key tokens
+
+        if BIAS_TYPE != 'none':
+            tl.debug_barrier()
+            if BIAS_TYPE == 'vector':
+                if EVEN_N:
+                    bias = tl.load(b_ptrs).to(tl.float32)
+                else:
+                    bias = tl.load(b_ptrs, mask=offs_n < seqlen_k, other=0.0).to(tl.float32)
+            elif BIAS_TYPE == 'matrix':
+                if EVEN_M & EVEN_N:
+                    bias = tl.load(b_ptrs).to(tl.float32)
+                else:
+                    bias = tl.load(
+                        b_ptrs,
+                        mask=(offs_m_curr[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k),
+                        other=0.0
+                    ).to(tl.float32)
+
+            qk = qk * softmax_scale + bias
+
+        if not (EVEN_M & EVEN_HEADDIM):
+            tl.debug_barrier()
+        
+        lse_i = tl.load(LSE + offs_m_curr)
+        
+        if BIAS_TYPE == 'none':
+            p = tl.exp(qk * softmax_scale - lse_i[:, None])
+        else:
+            p = tl.exp(qk - lse_i[:, None])
+
+        if EVEN_M & EVEN_HEADDIM:
+            do = tl.load(do_ptrs)
+        else:
+            do = tl.load(
+                do_ptrs,
+                mask=(offs_m_curr[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
+                other=0.0
+            )
+
+        dv += tl.dot(p.to(do.dtype), do, trans_a=True)
+
+        if not (EVEN_M & EVEN_HEADDIM):
+            tl.debug_barrier()
+
+        Di = tl.load(D + offs_m_curr)
+
+        ds = (p * (dp - Di[:, None]) * softmax_scale).to(q.dtype)
+
+        dk += tl.dot(ds, q, trans_a=True)
+
+        if not (EVEN_M & EVEN_HEADDIM):
+            tl.debug_barrier()
+        
+        if not ATOMIC_ADD:
+            if EVEN_M & EVEN_HEADDIM:
+                dq = tl.load(dq_ptrs, eviction_policy='evict_last') # Loading delta of query, no padding
+                dq += tl.dot(ds, k)
+                tl.store(dq_ptrs, dq, eviction_policy='evict_last') # Storing delta of query, no padding
+            else:
+                if EVEN_HEADDIM:
+                    dq=tl.load(
+                        dq_ptrs,
+                        mask=offs_m_curr[:, None] < seqlen_q,
+                        other=0.0,
+                        eviction_policy='evict_last'
+                    ) # Loading delta of query, padding invalid query tokens
+                    dq += tl.dot(ds, k)
+                    tl.store(
+                        dq_ptrs,
+                        dq,
+                        mask=offs_m_curr[:, None] < seqlen_q,
+                        eviction_policy='evict_last'
+                    ) # Storing delta of query, padding invalid query tokens
+                else:
+                    dq = tl.load(
+                        dq_ptrs,
+                        dq,
+                        mask=(offs_m_curr[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
+                        other=0.0,
+                        eviction_policy='evict_last'
+                    ) # Loading delta of query, padding invalid query tokens and head dimension
+                    dq += tl.dot(ds, k)
+                    tl.store(
+                        dq_ptrs,
+                        dq,
+                        mask=(offs_m_curr[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
+                        eviction_policy='evict_last'
+                    )
+        else: # Parallezing across seqlen_k dimension
+            dq = tl.dot(ds, k)
+            
+            if EVEN_M & EVEN_HEADDIM:
+                tl.atomic_add(dq_ptrs, dq)
+            else:
+                if EVEN_HEADDIM:
+                    tl.atomic_add(dq_ptrs, dq, mask=offs_m_curr[:, None] < seqlen_q)
+                else:
+                    tl.atomic_add(
+                        dq_ptrs,
+                        dq,
+                        mask=(offs_m_curr[:, None] < seqlen_q) & (offs_d[None, :] < headdim)
+                    )
+
+        dq_ptrs += BLOCK_M * stride_dqm
+        q_ptrs += BLOCK_M * stride_qm
+        do_ptrs += BLOCK_M * stride_dom
+
+        if BIAS_TYPE == 'matrix':
+            b_ptrs += BLOCK_M * stride_bm 
+
+    dv_ptrs = DV + (offs_n[:, None] * stride_dvn + offs_d[None, :])
+    dk_ptrs = DK + (offs_n[:, None] * stride_dkn + offs_d[None, :])
+
+    _bwd_store_dk_dv(
+        dk_ptrs,
+        dv_ptrs,
+        dk,
+        dv,
+        offs_n,
+        offs_d,
+        seqlen_k,
+        headdim,
+        EVEN_M,
+        EVEN_N, 
+        EVEN_HEADDIM
+    )
+
+def init_to_zero(name):
+    return lambda nargs: nargs[name].zero_()
+
 
 # export TRITON_PRINT_AUTOTUNING=1
