@@ -762,5 +762,412 @@ def _bwd_kernel_one_col_block(
 def init_to_zero(name):
     return lambda nargs: nargs[name].zero_()
 
+@triton.jit
+def _bwd_kernel(
+    Q: tl.tensor,
+    K: tl.tensor,
+    V: tl.tensor,
+    Bias: tl.tensor,
+    DO: tl.tensor,
+    DQ: tl.tensor,
+    DK: tl.tensor,
+    DV: tl.tensor,
+    LSE: tl.tensor,
+    D: tl.tensor,
+    softmax_scale: tl.float32,
+    stride_qb: tl.int32,
+    stride_qh: tl.int32,
+    stride_qm: tl.int32,
+    stride_kb: tl.int32,
+    stride_kh: tl.int32,
+    stride_kn: tl.int32,
+    stride_vb: tl.int32,
+    stride_vh: tl.int32,
+    stride_vn: tl.int32,
+    stride_bb: tl.int32,
+    stride_bh: tl.int32,
+    stride_bm: tl.int32,
+    stride_dob: tl.int32,
+    stride_doh: tl.int32,
+    stride_dom: tl.int32,
+    stride_dqb: tl.int32,
+    stride_dqh: tl.int32,
+    stride_dqm: tl.int32,
+    stride_dkb: tl.int32,
+    stride_dkh: tl.int32,
+    stride_dkn: tl.int32,
+    stride_dvb: tl.int32,
+    stride_dvh: tl.int32,
+    stride_dvn: tl.int32,
+    nheads: tl.int32,
+    seqlen_q: tl.int32,
+    seqlen_k: tl.int32,
+    seqlen_q_rounded: tl.int32,
+    headdim: tl.int32,
+    CACHE_KEY_SEQLEN_Q: tl.int32,
+    CACHE_KEY_SEQLEN_K: tl.int32,
+    BIAS_TYPE: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    BLOCK_HEADDIM: tl.constexpr,
+    SEQUENCE_PARALLEL: tl.constexpr,
+    EVEN_M: tl.constexpr,
+    EVEN_N: tl.constexpr,
+    EVEN_HEADDIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr
+):
+    # Initialzing offsets for head batch, head and batch
+    off_hb = tl.program_id(1) 
+    off_b = off_hb // nheads
+    off_h = off_hb % nheads 
 
+    # Offset pointers for batch and head
+    Q += off_b * stride_qb + off_h * stride_qh
+    # Query + (batch offset * query batch stride) + (head offset * query head stride)
+    K += off_b * stride_kb + off_h * stride_kh
+    # Key + (batch offset * key batch stride) + (head offset * key head stride)
+    V += off_b * stride_vb + off_h * stride_vh
+    # Value + (batch offset * value batch stride) + (head offset * value head stride)
+    DO += off_b * stride_dob + off_h * stride_doh
+    # Delta of Output + (batch offset * delta output batch stride) + (head offset * delta output head stride)
+    DQ += off_b * stride_dqb + off_h * stride_dqh
+    # Delta of Query + (batch offset * delta query batch stride) + (head offset * delta query head stride)
+    DK += off_b * stride_dkb + off_h * stride_dkh 
+    # Delta of Key + (batch offset * delta key batch stride) + (head offset * delta key head stride)
+    DV += off_b * stride_dvb + off_h * stride_dvh 
+    # Delta of Value + (batch offset * delta value batch stride) + (head offset * delta value head stride)
+
+    if BIAS_TYPE != 'none':
+        Bias += off_b * stride_bb + off_h * stride_bh
+        # Bias + (batch offset * bias batch stride) + (head offset * bias head stride)
+
+    D += off_hb * seqlen_q_rounded 
+    LSE += off_hb * seqlen_q_rounded 
+
+    if not SEQUENCE_PARALLEL:
+        num_block_n = tl.cdiv(seqlen_k, BLOCK_N) 
+
+        for start_n in range(0, num_block_n):
+            _bwd_kernel_one_col_block(
+                start_n,
+                Q,
+                K,
+                V,
+                Bias, 
+                DO,
+                DQ,
+                DK,
+                DV,
+                LSE,
+                D,
+                softmax_scale,
+                stride_qm,
+                stride_kn,
+                stride_vn,
+                stride_bm,
+                stride_dom,
+                stride_dqm,
+                stride_dkn,
+                stride_dvn,
+                seqlen_q,
+                seqlen_k,
+                headdim,
+                ATOMIC_ADD=False,
+                BIAS_TYPE=BIAS_TYPE,
+                IS_CAUSAL=IS_CAUSAL,
+                BLOCK_HEADDIM=BLOCK_HEADDIM,
+                EVEN_M=EVEN_M,
+                EVEN_N=EVEN_N,
+                EVEN_HEADDIM=EVEN_HEADDIM,
+                BLOCK_M=BLOCK_M,
+                BLOCK_N=BLOCK_N
+            )
+    else:
+        start_n = tl.program_id(0)
+
+        _bwd_kernel_one_col_block(
+                start_n,
+                Q,
+                K,
+                V,
+                Bias, 
+                DO,
+                DQ,
+                DK,
+                DV,
+                LSE,
+                D,
+                softmax_scale,
+                stride_qm,
+                stride_kn,
+                stride_vn,
+                stride_bm,
+                stride_dom,
+                stride_dqm,
+                stride_dkn,
+                stride_dvn,
+                seqlen_q,
+                seqlen_k,
+                headdim,
+                ATOMIC_ADD=False,
+                BIAS_TYPE=BIAS_TYPE,
+                IS_CAUSAL=IS_CAUSAL,
+                BLOCK_HEADDIM=BLOCK_HEADDIM,
+                EVEN_M=EVEN_M,
+                EVEN_N=EVEN_N,
+                EVEN_HEADDIM=EVEN_HEADDIM,
+                BLOCK_M=BLOCK_M,
+                BLOCK_N=BLOCK_N
+        )
+
+def _flash_attn_forward(
+    q: tl.tensor,
+    k: tl.tensor,
+    v: tl.tensor,
+    bias: tl.tensor = None,
+    causal: bool = False,
+    softmax_scale: tl.float32 = None,
+):
+    '''
+    Flash Attention Forward Pass - Self Attention Only
+
+    Args:
+        q: Query tensor of shape (batch_size, num_heads, seqlen_q, head_dim)
+        k: Key tensor of shape (batch_size, num_heads, seqlen_k, head_dim)
+        v: Value tensor of shape (batch_size, num_heads, seqlen_k, head_dim)
+        bias: Bias tensor of shape (batch_size, num_heads, seqlen_q, seqlen_k)
+        causal: Whether to apply causal masking
+        softmax_scale: Scale factor for softmax
+    '''
+
+    # Shapes
+    batch, seqlen_q, nheads, d = q.shape
+    _, seqlen_k, _, _ = k.shape # self attention ONLY 
+
+    assert k.shape == (batch, seqlen_k, nheads, d)
+    assert v.shape == (batch, seqlen_k, nheads, d)
+    assert d <= 128, 'Current implementation only supports head_dim <= 128, fixing'
+    assert q.dtype == k.dtype == v.dtype, 'All tensors must have the same dtype'
+    assert q.dtype in [tl.float16, tl.bfloat16], 'Only float16 and bfloat16 are supported'
+    assert q.is_cuda and k.is_cuda and v.is_cuda, 'Triton kernels only support CUDA'
+    softmax_scale = softmax_scale or 1.0 / math.sqrt(d)
+
+    # Bias
+    has_bias = bias is not None
+    bias_type = 'none'
+    if has_bias:
+        assert bias.dtype in [q.dtype, torch.float], 'Bias must be same dtype as query or float'
+        assert bias.is_cuda, 'Triton kernels only support CUDA'
+        assert bias.dim == 4, 'Bias must be 4D'
+
+        if bias.stride(-1) != 1:
+            bias = bias.contiguous()
+        if bias.shape[2:] == (1, seqlen_k):
+            bias_type = 'vector'
+        elif bias.shape[2:] == (seqlen_q, seqlen_k):
+            bias_type = 'matrix'
+        else:
+            raise RuntimeError(
+                'Last two dimensions of bias must be (1, seqlen_k) or (seqlen_q, seqlen_k)'
+            )
+
+        bias = bias.expand(batch, nheads, seqlen_q, seqlen_k)
+    
+    bias_strides = (bias.stride(0), bias.stride(1), bias.stride(2)) if has_bias else (0, 0, 0)
+
+    seqlen_q_rounded = math.ceil(seqlen_q / 128) * 128
+
+    lse = torch.empty((batch, nheads, seqlen_q_rounded), device=q.device, dtype=torch.float32)
+    tmp = torch.empty((batch, nheads, seqlen_q_rounded), device=q.device, dtype=torch.float32)
+    o = torch.empty_like(q)
+
+    BLOCK_HEADDIM = max(triton.next_power_of_2(d), 16)
+    BLOCK = 128
+
+    grid = lambda META: (triton.cdiv(seqlen_q, META['BLOCK_M']), batch * nheads, META['num_wraps'], META['num_stages'])
+    _fwd_kernel[grid](
+        q,
+        k,
+        v,
+        bias,
+        o,
+        lse,
+        tmp,
+        softmax_scale,
+        q.stride(0),
+        q.stride(2),
+        q.stride(1),
+        k.stride(0),
+        k.stride(2),
+        k.stride(1),
+        v.stride(0),
+        v.stride(2),
+        v.stride(1),
+        *bias_strides,
+        o.stride(0),
+        o.stride(2),
+        o.stride(1),
+        nheads,
+        seqlen_q,
+        seqlen_k,
+        seqlen_q_rounded,
+        d,
+        seqlen_q // 32,
+        seqlen_k // 32,
+        bias_type,
+        causal,
+        BLOCK_HEADDIM,
+        BLOCK_M=BLOCK,
+        BLOCK_N=BLOCK,
+        num_wraps=grid[2],
+        num_stages=grid[3]
+    )
+
+    return o, lse, softmax_scale
+
+def _flash_attn_backward(
+    do,
+    q,
+    k,
+    v,
+    o,
+    lse,
+    dq,
+    dk,
+    dv,
+    bias=None,
+    causal=False,
+    softmax_scale=None
+):
+    '''
+    Flash Attention Backward Pass - Self Attention Only
+
+    Args:
+        do: Delta of Output tensor of shape (batch_size, num_heads, seqlen_q, seqlen_k)
+        q: Query tensor of shape (batch_size, seqlen_q, num_heads, head_dim)
+        k: Key tensor of shape (batch_size, seqlen_k, num_heads, head_dim)
+        v: Value tensor of shape (batch_size, seqlen_k, num_heads, head_dim)
+        o: Output tensor of shape (batch_size, seqlen_q, num_heads, head_dim)
+        lse: Log Sum Exponential tensor of shape (batch_size, num_heads, seqlen_q)
+        dq: Delta of Query tensor of shape (batch_size, num_heads, seqlen_q, head_dim)
+        dk: Delta of Key tensor of shape (batch_size, seqlen_k, num_heads, head_dim)
+        dv: Delta of Value tensor of shape (batch_size, seqlen_k, num_heads, head_dim)
+        bias: Bias tensor of shape (batch_size, seqlen_q, num_heads, seqlen_k)
+        causal: Whether to apply causal masking
+        softmax_scale: Scale factor for softmax
+    '''
+
+    if do.stride(-1) != 1:
+        do = do.contiguous()
+
+    # Shapes
+    batch, seqlen_q, nheads, d = q.shape 
+    _, seqlen_k, _, _ = k.shape
+
+    assert d <= 128, 'Current implementation only supports head_dim <= 128, fixing'
+    
+    seqlen_q_rounded = math.ceil(seqlen_q / 128) * 128
+
+    assert lse.shape == (batch, nheads, seqlen_q_rounded), 'LSE must be of shape (batch, num_heads, seqlen_q_rounded)'
+    assert q.stride(-1) == k.stride(-1) == v.stride(-1) == o.stride(-1) == 1, 'All tensors must be contiguous'
+    assert dq.stride(-1) == dk.stride(-1) == dv.stride(-1) == 1, 'Deltas must be contiguous'
+
+    softmax_scale = softmax_scale or 1.0 / math.sqrt(d)
+    
+    dq_accum = torch.empty_like(q, dtype=torch.float32)
+    delta = torch.empty_like(lse)
+
+    BLOCK_HEADDIM = max(triton.next_power_of_2(d), 16)
+
+    grid = lambda META: (triton.cdiv(seqlen_q, META['BLOCK_M']), batch * nheads)
+    _bwd_preprocess_do_o_dot[grid](
+        o,
+        do,
+        delta,
+        o.stride(0),
+        o.stride(2),
+        o.stride(1),
+        do.stride(0),
+        do.stride(2),
+        do.stride(1),
+        nheads,
+        seqlen_q,
+        seqlen_q_rounded,
+        d,
+        BLOCK_M=128,
+        BLOCK_HEADDIM=BLOCK_HEADDIM,
+    )
+
+    has_bias = bias is not None
+    bias_type = 'none'
+    if has_bias:
+        assert bias.dtype in [q.dtype, torch.float], 'Bias must be same dtype as query or float'
+        assert bias.is_cuda, 'Triton kernels only support CUDA'
+        assert bias.dim == 4, 'Bias must be 4D'
+        assert bias.stride(-1) != 1, 'Bias must be contiguous'
+
+        if bias.shape[2:] == (1, seqlen_k):
+            bias_type = 'vector'
+        elif bias.shape[2:] == (seqlen_q, seqlen_k):
+            bias_type = 'matrix'
+        else:
+            raise RuntimeError(
+                'Last two dimensions of bias must be (1, seqlen_k) or (seqlen_q, seqlen_k)'
+            )
+
+        bias = bias.expand(batch, nheads, seqlen_q, seqlen_k)
+    
+    bias_strides = (bias.stride(0), bias.stride(1), bias.stride(2)) if has_bias else (0, 0, 0)
+
+    grid = lambda META: (
+        triton.cdiv(seqlen_k, META['BLOCK_N']) if META['SEQUENCE_PARALLEL'] else 1,
+        batch * nheads,
+        META['num_wraps'],
+        META['num_stages']
+    )
+
+    _bwd_kernel[grid](
+        q,
+        k,
+        v,
+        bias,
+        do,
+        dq_accum,
+        dk,
+        dv,
+        lse,
+        delta,
+        softmax_scale,
+        q.stride(0),
+        q.stride(2),
+        q.stride(1),
+        k.stride(0),
+        k.stride(2),
+        k.stride(1),
+        v.stride(0),
+        v.stride(2),
+        v.stride(1),
+        *bias_strides,
+        do.stride(0),
+        do.stride(2),
+        do.stride(1),
+        dq_accum.stride(0),
+        dq_accum.stride(2),
+        dq_accum.stride(1),
+        dv.stride(0),
+        dv.stride(2),
+        dv.stride(1),
+        nheads,
+        seqlen_q,
+        seqlen_k,
+        seqlen_q_rounded,
+        d,
+        seqlen_q // 32,
+        seqlen_k // 32,
+        bias_type,
+        causal,
+        BLOCK_HEADDIM
+    )
+
+    dq.copy_(dq_accum)
 # export TRITON_PRINT_AUTOTUNING=1
